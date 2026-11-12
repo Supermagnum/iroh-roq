@@ -1,3 +1,9 @@
+use std::{
+    future::Future,
+    pin::pin,
+    task::{Context, Poll, Waker},
+};
+
 use anyhow::{ensure, Result};
 use bytes::BytesMut;
 use iroh::endpoint::{Connection, VarInt};
@@ -8,6 +14,15 @@ use tracing::debug;
 use webrtc_util::marshal::{Marshal, MarshalSize};
 
 use crate::SendStream;
+
+fn poll_once<F: Future>(fut: F) -> Option<F::Output> {
+    let mut fut = pin!(fut);
+    let waker = Waker::noop();
+    match fut.as_mut().poll(&mut Context::from_waker(waker)) {
+        Poll::Ready(v) => Some(v),
+        Poll::Pending => None,
+    }
+}
 
 /// The sending side of an RTP flow.
 #[derive(Clone, Debug)]
@@ -54,8 +69,8 @@ impl SendFlow {
 
     /// Send an RTP packet, waiting for datagram buffer space if needed.
     ///
-    /// Prefer this for bursty media; [`Self::send_rtp`] is the original
-    /// non-blocking path kept for API compatibility with upstream.
+    /// Prefer this for bursty media tests. Live media should use
+    /// [`Self::try_send_rtp`] (drop on congestion — late audio is worse than loss).
     pub async fn send_rtp_wait(&self, packet: &RtpPacket) -> Result<()> {
         ensure!(!self.cancel_token.is_cancelled(), "flow is closed");
 
@@ -72,6 +87,39 @@ impl SendFlow {
         self.conn.send_datagram_wait(buf.freeze()).await?;
 
         Ok(())
+    }
+
+    /// Non-blocking datagram send for live media.
+    ///
+    /// Returns `Ok(true)` if the packet was queued, `Ok(false)` if the send
+    /// buffer is full (this packet was **not** queued — caller should count a
+    /// drop). Unlike [`Self::send_rtp`], this does not discard older queued
+    /// datagrams to make space.
+    pub fn try_send_rtp(&self, packet: &RtpPacket) -> Result<bool> {
+        ensure!(!self.cancel_token.is_cancelled(), "flow is closed");
+
+        debug!(flow_id = %self.id, "try send datagram RTP packet");
+
+        let mut buf = BytesMut::new();
+        self.id.encode(&mut buf);
+        let marshal_size = packet.marshal_size();
+        let id_len = buf.len();
+        buf.resize(id_len + marshal_size, 0);
+        let n = packet.marshal_to(&mut buf[id_len..])?;
+        ensure!(n == marshal_size, "inconsistent packet marshal");
+
+        let data = buf.freeze();
+        let fut = self.conn.send_datagram_wait(data);
+        match poll_once(fut) {
+            Some(Ok(())) => Ok(true),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(false),
+        }
+    }
+
+    /// Maximum QUIC datagram payload size currently advertised for this connection.
+    pub fn max_datagram_size(&self) -> Option<usize> {
+        self.conn.max_datagram_size()
     }
 
     /// Creates a new `SendStream`.
