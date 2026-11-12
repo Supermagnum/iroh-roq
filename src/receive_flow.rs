@@ -33,17 +33,24 @@ impl ReceiveFlow {
         self.id
     }
 
-    /// Reads the next available RTP packet.
-    pub async fn read_rtp(&mut self) -> Result<RtpPacket> {
+    /// Reads the next available datagram payload (after flow-id), raw bytes.
+    ///
+    /// Use this for SRTP (or other AEAD) envelopes; [`Self::read_rtp`] unmarshals
+    /// plain RTP.
+    pub async fn read_bytes(&mut self) -> Result<Bytes> {
         ensure!(!self.cancel_token.is_cancelled(), "closed");
-        let Some(mut bytes) = self.datagram_receiver.recv().await else {
+        let Some(bytes) = self.datagram_receiver.recv().await else {
             return Err(anyhow::anyhow!("session is closed"));
         };
+        debug!(flow_id = %self.id, len = bytes.len(), "received datagram payload");
+        Ok(bytes)
+    }
 
+    /// Reads the next available RTP packet.
+    pub async fn read_rtp(&mut self) -> Result<RtpPacket> {
+        let mut bytes = self.read_bytes().await?;
         let packet = RtpPacket::unmarshal(&mut bytes)?;
-
         debug!(flow_id = %self.id, "received packet");
-
         Ok(packet)
     }
 

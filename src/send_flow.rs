@@ -122,6 +122,25 @@ impl SendFlow {
         self.conn.max_datagram_size()
     }
 
+    /// Non-blocking send of an opaque payload (e.g. an SRTP packet) after the flow id.
+    ///
+    /// Returns `Ok(true)` if queued, `Ok(false)` if the datagram buffer is full.
+    pub fn try_send_payload(&self, payload: &[u8]) -> Result<bool> {
+        ensure!(!self.cancel_token.is_cancelled(), "flow is closed");
+        debug!(flow_id = %self.id, len = payload.len(), "try send datagram payload");
+
+        let mut buf = BytesMut::new();
+        self.id.encode(&mut buf);
+        buf.extend_from_slice(payload);
+        let data = buf.freeze();
+        let fut = self.conn.send_datagram_wait(data);
+        match poll_once(fut) {
+            Some(Ok(())) => Ok(true),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(false),
+        }
+    }
+
     /// Creates a new `SendStream`.
     ///
     /// This will use the stream based path.
